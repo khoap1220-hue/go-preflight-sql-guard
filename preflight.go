@@ -243,6 +243,80 @@ func ValidatePostgresOrSQLiteDSN(rawDSN string, requireTLSForRemote bool) (DSNVa
 	}, nil
 }
 
+// WALHeaderInfo contains metadata parsed from the 32-byte header of a SQLite3 write-ahead log.
+type WALHeaderInfo struct {
+	Magic              uint32 `json:"magic"`
+	FormatVersion      uint32 `json:"format_version"`
+	PageSize           uint32 `json:"page_size"`
+	CheckpointSeq      uint32 `json:"checkpoint_seq"`
+	FrameCountEstimate int64  `json:"frame_count_estimate"`
+}
+
+// InspectSQLiteWAL reads and parses the 32-byte binary header of a SQLite3 -wal file,
+// validating the magic bytes (0x377f0682 or 0x377f0683) and estimating the uncheckpointed frame count.
+func InspectSQLiteWAL(walPath string) (*WALHeaderInfo, error) {
+	f, err := os.Open(walPath)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite wal file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat sqlite wal file: %w", err)
+	}
+	if stat.Size() < 32 {
+		return nil, fmt.Errorf("file %q is too small (%d bytes) to be a valid SQLite3 WAL (minimum 32 bytes)", walPath, stat.Size())
+	}
+
+	var hdr [32]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return nil, fmt.Errorf("read 32-byte sqlite wal header: %w", err)
+	}
+
+	var order binary.ByteOrder
+	var magic uint32
+
+	rawBig := binary.BigEndian.Uint32(hdr[0:4])
+	if rawBig == 0x377f0683 {
+		order = binary.BigEndian
+		magic = 0x377f0683
+	} else if rawBig == 0x377f0682 {
+		order = binary.BigEndian
+		magic = 0x377f0682
+	} else if binary.LittleEndian.Uint32(hdr[0:4]) == 0x377f0682 {
+		order = binary.LittleEndian
+		magic = 0x377f0682
+	} else if binary.LittleEndian.Uint32(hdr[0:4]) == 0x377f0683 {
+		order = binary.LittleEndian
+		magic = 0x377f0683
+	} else {
+		return nil, fmt.Errorf("invalid SQLite WAL magic header 0x%08x in %q", rawBig, walPath)
+	}
+
+	formatVersion := order.Uint32(hdr[4:8])
+	pageSize := order.Uint32(hdr[8:12])
+	checkpointSeq := order.Uint32(hdr[12:16])
+
+	if pageSize == 0 {
+		return nil, fmt.Errorf("invalid SQLite WAL page size 0 in %q", walPath)
+	}
+
+	frameSize := int64(24 + pageSize)
+	var frameCount int64
+	if stat.Size() >= 32 {
+		frameCount = (stat.Size() - 32) / frameSize
+	}
+
+	return &WALHeaderInfo{
+		Magic:              magic,
+		FormatVersion:      formatVersion,
+		PageSize:           pageSize,
+		CheckpointSeq:      checkpointSeq,
+		FrameCountEstimate: frameCount,
+	}, nil
+}
+
 var sqlite3MagicHeader = []byte("SQLite format 3\x00")
 
 // SQLiteHeaderInfo contains binary metadata parsed directly from the first 100 bytes of a SQLite3 database file.

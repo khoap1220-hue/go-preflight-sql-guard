@@ -190,3 +190,71 @@ func TestQueryCostTracker_ConcurrentRaceSafetyAndTrackQuery(t *testing.T) {
 		t.Fatalf("unexpected concurrent cost attribution summary: %+v", summary)
 	}
 }
+
+func TestInspectSQLiteWAL_BigAndLittleEndianAndFrameEstimate(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Synthetic Big-Endian WAL with 2 frames
+	beWalPath := filepath.Join(tmpDir, "ledger.db-wal")
+	pageSize := uint32(4096)
+	frameSize := 24 + pageSize
+	beData := make([]byte, 32+2*frameSize)
+	binary.BigEndian.PutUint32(beData[0:4], 0x377f0683)
+	binary.BigEndian.PutUint32(beData[4:8], 3007000)
+	binary.BigEndian.PutUint32(beData[8:12], pageSize)
+	binary.BigEndian.PutUint32(beData[12:16], 42) // checkpoint sequence
+
+	if err := os.WriteFile(beWalPath, beData, 0600); err != nil {
+		t.Fatalf("failed to write big-endian wal: %v", err)
+	}
+
+	beInfo, err := InspectSQLiteWAL(beWalPath)
+	if err != nil {
+		t.Fatalf("InspectSQLiteWAL failed on big-endian wal: %v", err)
+	}
+	if beInfo.Magic != 0x377f0683 || beInfo.PageSize != 4096 || beInfo.CheckpointSeq != 42 || beInfo.FrameCountEstimate != 2 {
+		t.Fatalf("unexpected beInfo: %+v", beInfo)
+	}
+
+	// 2. Synthetic Little-Endian WAL with 1 frame
+	leWalPath := filepath.Join(tmpDir, "ledger_le.db-wal")
+	leData := make([]byte, 32+1*frameSize)
+	binary.LittleEndian.PutUint32(leData[0:4], 0x377f0682)
+	binary.LittleEndian.PutUint32(leData[4:8], 3007000)
+	binary.LittleEndian.PutUint32(leData[8:12], pageSize)
+	binary.LittleEndian.PutUint32(leData[12:16], 99)
+
+	if err := os.WriteFile(leWalPath, leData, 0600); err != nil {
+		t.Fatalf("failed to write little-endian wal: %v", err)
+	}
+
+	leInfo, err := InspectSQLiteWAL(leWalPath)
+	if err != nil {
+		t.Fatalf("InspectSQLiteWAL failed on little-endian wal: %v", err)
+	}
+	if leInfo.Magic != 0x377f0682 || leInfo.PageSize != 4096 || leInfo.CheckpointSeq != 99 || leInfo.FrameCountEstimate != 1 {
+		t.Fatalf("unexpected leInfo: %+v", leInfo)
+	}
+
+	// 3. Truncated WAL file (< 32 bytes)
+	truncWalPath := filepath.Join(tmpDir, "trunc.db-wal")
+	if err := os.WriteFile(truncWalPath, beData[:20], 0600); err != nil {
+		t.Fatalf("failed to write truncated wal: %v", err)
+	}
+	_, err = InspectSQLiteWAL(truncWalPath)
+	if err == nil {
+		t.Fatal("expected error on truncated WAL file, got nil")
+	}
+
+	// 4. Invalid Magic
+	badMagicWalPath := filepath.Join(tmpDir, "bad_magic.db-wal")
+	badData := make([]byte, 32)
+	binary.BigEndian.PutUint32(badData[0:4], 0xdeadbeef)
+	if err := os.WriteFile(badMagicWalPath, badData, 0600); err != nil {
+		t.Fatalf("failed to write bad magic wal: %v", err)
+	}
+	_, err = InspectSQLiteWAL(badMagicWalPath)
+	if err == nil {
+		t.Fatal("expected error on invalid magic bytes, got nil")
+	}
+}
