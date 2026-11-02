@@ -175,6 +175,59 @@ func NewSQLReadOnlyQueryProbe(db *sql.DB, query string) ProbeFunc {
 	}
 }
 
+// Queryer provides an interface for executing single-row SQL queries, matching *sql.DB and *sql.Tx.
+type Queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// WatermarkProbeConfig defines configuration for verifying a table's checkpoint sequence.
+type WatermarkProbeConfig struct {
+	Table       string `json:"table"`
+	CursorCol   string `json:"cursor_col"`
+	MinSequence uint32 `json:"min_sequence"`
+}
+
+var sqlIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
+// VerifyTableAndWatermark performs a read-only query to fetch the maximum sequence in the given table and cursor column,
+// verifying that table and cursor column names are safe alphanumeric/underscore identifiers and that the sequence >= minSequence.
+func VerifyTableAndWatermark(ctx context.Context, q Queryer, table string, cursorCol string, minSequence uint32) (uint32, error) {
+	if q == nil {
+		return 0, errors.New("nil queryer provided")
+	}
+	if !sqlIdentifierRegex.MatchString(table) {
+		return 0, fmt.Errorf("invalid table identifier %q: must contain only alphanumeric characters and underscores", table)
+	}
+	if !sqlIdentifierRegex.MatchString(cursorCol) {
+		return 0, fmt.Errorf("invalid cursor column identifier %q: must contain only alphanumeric characters and underscores", cursorCol)
+	}
+
+	query := fmt.Sprintf("SELECT COALESCE(MAX(%s), 0) FROM %s", cursorCol, table)
+	var watermark int64
+	if err := q.QueryRowContext(ctx, query).Scan(&watermark); err != nil {
+		return 0, fmt.Errorf("watermark probe query failed on %s.%s: %w", table, cursorCol, err)
+	}
+	if watermark < 0 {
+		return 0, fmt.Errorf("watermark sequence is negative: %d", watermark)
+	}
+	seq := uint32(watermark)
+	if seq < minSequence {
+		return seq, fmt.Errorf("stored watermark sequence %d is below minimum required sequence %d (cursor regression)", seq, minSequence)
+	}
+	return seq, nil
+}
+
+// NewWatermarkProbe constructs a ProbeFunc that verifies table watermark invariants.
+func NewWatermarkProbe(q Queryer, cfg WatermarkProbeConfig) ProbeFunc {
+	return func(ctx context.Context) (string, error) {
+		seq, err := VerifyTableAndWatermark(ctx, q, cfg.Table, cfg.CursorCol, cfg.MinSequence)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("table=%s cursor=%s sequence=%d min=%d", cfg.Table, cfg.CursorCol, seq, cfg.MinSequence), nil
+	}
+}
+
 // DSNValidationReport summarizes security and durability properties of a database connection string.
 type DSNValidationReport struct {
 	Driver      string `json:"driver"`
