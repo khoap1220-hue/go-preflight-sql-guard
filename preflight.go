@@ -104,8 +104,10 @@ func (r *PreflightRunner) RunAll(ctx context.Context) ([]ProbeResult, error) {
 	return results, nil
 }
 
-var writeKeywordRegex = regexp.MustCompile(`(?i)\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|VACUUM|ATTACH|DETACH|REINDEX|COPY)\b`)
-var pragmaWriteRegex = regexp.MustCompile(`(?i)\bPRAGMA\s+[a-zA-Z0-9_.]+\s*=`)
+var writeKeywordRegex = regexp.MustCompile(`(?i)\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|VACUUM|ATTACH|DETACH|REINDEX|COPY|INTO|CALL|EXEC|EXECUTE|MERGE|LOCK|SET|DO|DISCARD|CHECKPOINT|CLUSTER)\b`)
+var pragmaWriteRegex = regexp.MustCompile(`(?i)\bPRAGMA\s+[a-zA-Z0-9_.]+\s*(=|\()`)
+var dangerousPGFuncRegex = regexp.MustCompile(`(?i)\b(pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_promote|set_config|nextval|setval|lo_import|lo_export|lo_unlink)\s*\(`)
+var readOnlyStartRegex = regexp.MustCompile(`(?is)^(SELECT|PRAGMA|SHOW|EXPLAIN|WITH)\b`)
 
 // IsReadOnlySQLQuery enforces that a SQL probe string is a single-statement read-only query.
 func IsReadOnlySQLQuery(query string) error {
@@ -114,7 +116,10 @@ func IsReadOnlySQLQuery(query string) error {
 		return errors.New("SQL query cannot be empty")
 	}
 	// Strip single trailing semicolon if present, then reject any internal semicolons (stacked queries)
-	withoutTrailing := strings.TrimSuffix(trimmed, ";")
+	withoutTrailing := strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
+	if withoutTrailing == "" {
+		return errors.New("SQL query cannot be empty")
+	}
 	if strings.Contains(withoutTrailing, ";") {
 		return errors.New("multi-statement stacked SQL queries are forbidden in read-only preflight probes")
 	}
@@ -125,11 +130,13 @@ func IsReadOnlySQLQuery(query string) error {
 		return errors.New("DDL/DML write keywords are forbidden in read-only preflight probes")
 	}
 	if pragmaWriteRegex.MatchString(withoutTrailing) {
-		return errors.New("mutating PRAGMA assignments are forbidden in read-only preflight probes")
+		return errors.New("mutating PRAGMA assignments or calls are forbidden in read-only preflight probes")
 	}
-	upper := strings.ToUpper(strings.TrimSpace(withoutTrailing))
-	if !strings.HasPrefix(upper, "SELECT ") && !strings.HasPrefix(upper, "PRAGMA ") && !strings.HasPrefix(upper, "SHOW ") && !strings.HasPrefix(upper, "EXPLAIN ") {
-		return errors.New("preflight SQL query must begin with SELECT, PRAGMA, SHOW, or EXPLAIN")
+	if dangerousPGFuncRegex.MatchString(withoutTrailing) {
+		return errors.New("mutating or administrative database functions are forbidden in read-only preflight probes")
+	}
+	if !readOnlyStartRegex.MatchString(withoutTrailing) {
+		return errors.New("preflight SQL query must begin with SELECT, PRAGMA, SHOW, EXPLAIN, or WITH")
 	}
 	return nil
 }
@@ -283,6 +290,9 @@ func InspectSQLiteFileHeader(filePath string) (SQLiteHeaderInfo, error) {
 	if rawPageSize == 1 {
 		pageSize = 65536
 	}
+	if pageSize < 512 || pageSize > 65536 || (pageSize&(pageSize-1)) != 0 {
+		return SQLiteHeaderInfo{}, fmt.Errorf("invalid SQLite3 page size %d in %q (must be power of two between 512 and 65536)", pageSize, filePath)
+	}
 	writeVer := hdr[18]
 	readVer := hdr[19]
 	changeCounter := binary.BigEndian.Uint32(hdr[24:28])
@@ -377,7 +387,13 @@ func (g *DegradationGuard) Execute(
 	primaryFn func() (any, error),
 	fallbackFn func() (any, error),
 ) (any, DegradationState, error) {
-	val, err := primaryFn()
+	var val any
+	var err error
+	if primaryFn == nil {
+		err = errors.New("primaryFn is nil")
+	} else {
+		val, err = primaryFn()
+	}
 	if err == nil {
 		g.mu.Lock()
 		g.consecutiveErrors = 0

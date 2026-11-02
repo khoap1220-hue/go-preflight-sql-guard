@@ -65,6 +65,8 @@ func TestPreflightRunner_AllPassAndCriticalFailure(t *testing.T) {
 func TestIsReadOnlySQLQuery_BlocksMutationsAndStackedQueries(t *testing.T) {
 	validQueries := []string{
 		"SELECT 1",
+		"SELECT\n  count(*)\nFROM ledgers;",
+		"WITH recent AS (SELECT 1) SELECT * FROM recent",
 		"SELECT schema_version FROM migrations ORDER BY id DESC LIMIT 1;",
 		"PRAGMA journal_mode",
 		"SHOW transaction_read_only",
@@ -78,10 +80,15 @@ func TestIsReadOnlySQLQuery_BlocksMutationsAndStackedQueries(t *testing.T) {
 
 	forbiddenQueries := []string{
 		"",
+		"   ;  ",
 		"DELETE FROM users WHERE id = 1",
 		"SELECT 1; DROP TABLE users",
 		"UPDATE balances SET amount = 0",
+		"SELECT * INTO hacked_table FROM users",
 		"PRAGMA journal_mode = DELETE",
+		"PRAGMA writable_schema(1)",
+		"SELECT pg_terminate_backend(123)",
+		"SELECT set_config('log_statement', 'none', false)",
 		"SELECT * FROM users -- comment injection",
 	}
 	for _, q := range forbiddenQueries {
@@ -123,6 +130,20 @@ func TestInspectSQLiteFileHeader_ReadsBinaryMetadataAndWAL(t *testing.T) {
 	probe := NewSQLiteFileProbe(rollbackDB, true)
 	if _, err := probe(context.Background()); err == nil {
 		t.Fatal("expected requireWAL=true probe to fail on rollback-mode SQLite file")
+	}
+
+	// Corrupt page size to non-power-of-two (999) and verify rejection
+	rawBytes, err := os.ReadFile(walDB)
+	if err != nil {
+		t.Fatalf("read synthetic db: %v", err)
+	}
+	binary.BigEndian.PutUint16(rawBytes[16:18], 999)
+	badPageDB := filepath.Join(t.TempDir(), "bad_pagesize.db")
+	if err := os.WriteFile(badPageDB, rawBytes, 0600); err != nil {
+		t.Fatalf("write bad_pagesize.db: %v", err)
+	}
+	if _, err := InspectSQLiteFileHeader(badPageDB); err == nil {
+		t.Fatal("expected non-power-of-two SQLite page size (999) to be rejected")
 	}
 }
 
