@@ -190,3 +190,44 @@ func TestQueryCostTracker_ConcurrentRaceSafetyAndTrackQuery(t *testing.T) {
 		t.Fatalf("unexpected concurrent cost attribution summary: %+v", summary)
 	}
 }
+
+func TestCheckWALSizeBudget_ThresholdEvaluation(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "indexer.db")
+	walPath := dbPath + "-wal"
+
+	// Create dummy db header
+	createSyntheticSQLiteFile(t, true)
+	// Write 2048 bytes of synthetic WAL data
+	walBytes := make([]byte, 2048)
+	if err := os.WriteFile(walPath, walBytes, 0600); err != nil {
+		t.Fatalf("failed to write wal file: %v", err)
+	}
+
+	// 1. Budget of 1024 bytes -> exceeded (2048 > 1024)
+	size, exceeded, err := CheckWALSizeBudget(dbPath, 1024)
+	if err != nil {
+		t.Fatalf("CheckWALSizeBudget failed: %v", err)
+	}
+	if !exceeded || size != 2048 {
+		t.Fatalf("expected exceeded=true size=2048, got exceeded=%v size=%d", exceeded, size)
+	}
+
+	// 2. Budget of 4096 bytes -> not exceeded (2048 <= 4096)
+	size, exceeded, err = CheckWALSizeBudget(dbPath, 4096)
+	if err != nil {
+		t.Fatalf("CheckWALSizeBudget failed: %v", err)
+	}
+	if exceeded || size != 2048 {
+		t.Fatalf("expected exceeded=false size=2048, got exceeded=%v size=%d", exceeded, size)
+	}
+
+	// 3. Unlimited budget (0) -> not exceeded
+	size, exceeded, err = CheckWALSizeBudget(dbPath, 0)
+	if err != nil {
+		t.Fatalf("CheckWALSizeBudget failed: %v", err)
+	}
+	if exceeded || size != 2048 {
+		t.Fatalf("expected exceeded=false size=2048, got exceeded=%v size=%d", exceeded, size)
+	}
+}

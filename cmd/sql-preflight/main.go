@@ -12,21 +12,28 @@ import (
 )
 
 type cliReport struct {
-	OverallPass bool                                 `json:"overall_pass"`
-	Probes      []preflight.ProbeResult              `json:"probes"`
-	SQLiteFiles []preflight.SQLiteHeaderInfo         `json:"sqlite_files,omitempty"`
-	DSNChecks   []preflight.DSNValidationReport      `json:"dsn_checks,omitempty"`
+	OverallPass bool                                  `json:"overall_pass"`
+	Probes      []preflight.ProbeResult               `json:"probes"`
+	SQLiteFiles []preflight.SQLiteHeaderInfo          `json:"sqlite_files,omitempty"`
+	DSNChecks   []preflight.DSNValidationReport       `json:"dsn_checks,omitempty"`
 	QueryCosts  map[string]preflight.QueryCostSummary `json:"query_costs,omitempty"`
-	Error       string                               `json:"error,omitempty"`
+	WALExceeded bool                                  `json:"wal_exceeded,omitempty"`
+	Error       string                                `json:"error,omitempty"`
 }
 
 func main() {
 	sqlitePathsFlag := flag.String("sqlite", "", "Comma-separated list of SQLite .db file paths to inspect")
+	dbFlag := flag.String("db", "", "Path to SQLite .db file (alias for -sqlite)")
+	maxWALBytesFlag := flag.Int64("max-wal-bytes", 0, "Maximum allowed companion -wal file size in bytes (default 0 = unlimited)")
 	requireWALFlag := flag.Bool("require-wal", false, "Require SQLite files to have WAL mode enabled in header")
 	dsnFlag := flag.String("dsn", "", "Database DSN string to validate for TLS and read-only safety")
 	requireTLSFlag := flag.Bool("require-tls", true, "Require TLS for remote PostgreSQL DSNs")
 	sqlQueryFlag := flag.String("check-sql", "SELECT 1", "Verify that a SQL query is strictly single-statement read-only")
 	flag.Parse()
+
+	if *sqlitePathsFlag == "" && *dbFlag != "" {
+		*sqlitePathsFlag = *dbFlag
+	}
 
 	runner := preflight.NewPreflightRunner()
 	tracker := preflight.NewQueryCostTracker()
@@ -56,6 +63,7 @@ func main() {
 		})
 	}
 
+	var walExceeded bool
 	if *sqlitePathsFlag != "" {
 		paths := strings.Split(*sqlitePathsFlag, ",")
 		for _, rawPath := range paths {
@@ -77,30 +85,40 @@ func main() {
 				if err != nil {
 					return "", err
 				}
+				if *maxWALBytesFlag > 0 && info.WALSizeBytes > *maxWALBytesFlag {
+					info.WALExceeded = true
+					walExceeded = true
+				}
 				sqliteInfos = append(sqliteInfos, info)
 				if *requireWALFlag && !info.WALMode {
 					return "", fmt.Errorf("file %q has write_version=%d (expected WAL=2)", pathCopy, info.WriteVersion)
 				}
-				return fmt.Sprintf("page_size=%d pages=%d size=%dB wal=%v encoding=%s", info.PageSize, info.PageCount, info.TotalSizeBytes, info.WALMode, info.TextEncoding), nil
+				return fmt.Sprintf("page_size=%d pages=%d size=%dB wal=%v wal_size=%dB encoding=%s", info.PageSize, info.PageCount, info.TotalSizeBytes, info.WALMode, info.WALSizeBytes, info.TextEncoding), nil
 			})
 		}
 	}
 
 	results, runErr := runner.RunAll(context.Background())
 	out := cliReport{
-		OverallPass: runErr == nil,
+		OverallPass: runErr == nil && !walExceeded,
 		Probes:      results,
 		SQLiteFiles: sqliteInfos,
 		DSNChecks:   dsnReports,
 		QueryCosts:  tracker.Snapshot(),
+		WALExceeded: walExceeded,
 	}
 	if runErr != nil {
 		out.Error = runErr.Error()
+	} else if walExceeded {
+		out.Error = fmt.Sprintf("wal file size budget exceeded (limit %d bytes)", *maxWALBytesFlag)
 	}
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+	if walExceeded {
+		os.Exit(4)
+	}
 	if runErr != nil {
 		os.Exit(1)
 	}
