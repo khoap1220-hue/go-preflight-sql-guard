@@ -2,7 +2,10 @@ package preflightguard
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
+	"io"
 	"errors"
 	"os"
 	"path/filepath"
@@ -188,5 +191,130 @@ func TestQueryCostTracker_ConcurrentRaceSafetyAndTrackQuery(t *testing.T) {
 	summary, ok := snap["alert_rollup_query"]
 	if !ok || summary.Calls != 20 || summary.TotalRows != 200 || summary.Errors != 0 {
 		t.Fatalf("unexpected concurrent cost attribution summary: %+v", summary)
+	}
+}
+
+type testMockConnector struct {
+	seq int64
+}
+
+func (c *testMockConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	return &testMockConn{seq: c.seq}, nil
+}
+func (c *testMockConnector) Driver() driver.Driver {
+	return &testMockDriver{seq: c.seq}
+}
+
+type testMockDriver struct {
+	seq int64
+}
+
+func (d *testMockDriver) Open(name string) (driver.Conn, error) {
+	return &testMockConn{seq: d.seq}, nil
+}
+
+type testMockConn struct {
+	seq int64
+}
+
+func (c *testMockConn) Prepare(query string) (driver.Stmt, error) {
+	return &testMockStmt{seq: c.seq}, nil
+}
+func (c *testMockConn) Close() error              { return nil }
+func (c *testMockConn) Begin() (driver.Tx, error) { return nil, nil }
+
+type testMockStmt struct {
+	seq int64
+}
+
+func (s *testMockStmt) Close() error                                    { return nil }
+func (s *testMockStmt) NumInput() int                                   { return -1 }
+func (s *testMockStmt) Exec(args []driver.Value) (driver.Result, error) { return nil, nil }
+func (s *testMockStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return &testMockRows{seq: s.seq}, nil
+}
+
+type testMockRows struct {
+	seq  int64
+	done bool
+}
+
+func (r *testMockRows) Columns() []string { return []string{"seq"} }
+func (r *testMockRows) Close() error      { return nil }
+func (r *testMockRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.seq
+	return nil
+}
+
+func TestVerifyTableAndWatermark_ValidAndRegressionAndSanitization(t *testing.T) {
+	// 1. Valid cursor >= minSequence
+	dbValid := sql.OpenDB(&testMockConnector{seq: 5000})
+	defer dbValid.Close()
+
+	seq, err := VerifyTableAndWatermark(context.Background(), dbValid, "history_ledgers", "sequence", 4000)
+	if err != nil {
+		t.Fatalf("expected valid watermark verification to succeed, got %v", err)
+	}
+	if seq != 5000 {
+		t.Fatalf("expected sequence 5000, got %d", seq)
+	}
+
+	// Test NewWatermarkProbe
+	probe := NewWatermarkProbe(dbValid, WatermarkProbeConfig{
+		Table:       "history_ledgers",
+		CursorCol:   "sequence",
+		MinSequence: 4000,
+	})
+	detail, pErr := probe(context.Background())
+	if pErr != nil || detail == "" {
+		t.Fatalf("expected watermark probe to pass, got detail=%q err=%v", detail, pErr)
+	}
+
+	// 2. Regressed sequence < minSequence
+	dbRegressed := sql.OpenDB(&testMockConnector{seq: 3500})
+	defer dbRegressed.Close()
+
+	_, err = VerifyTableAndWatermark(context.Background(), dbRegressed, "history_ledgers", "sequence", 4000)
+	if err == nil {
+		t.Fatal("expected error for regressed watermark sequence < minSequence, got nil")
+	}
+
+	// 3. Invalid table name with SQL injection attempt
+	invalidTables := []string{
+		"history_ledgers; DROP TABLE users--",
+		"table with spaces",
+		"table$name",
+		"table--comment",
+		"",
+	}
+	for _, badTable := range invalidTables {
+		_, err = VerifyTableAndWatermark(context.Background(), dbValid, badTable, "sequence", 100)
+		if err == nil {
+			t.Fatalf("expected error for malicious/invalid table identifier %q, got nil", badTable)
+		}
+	}
+
+	// 4. Invalid column name with SQL injection attempt
+	invalidCols := []string{
+		"sequence;--",
+		"col' OR '1'='1",
+		"col name",
+		"",
+	}
+	for _, badCol := range invalidCols {
+		_, err = VerifyTableAndWatermark(context.Background(), dbValid, "history_ledgers", badCol, 100)
+		if err == nil {
+			t.Fatalf("expected error for malicious/invalid column identifier %q, got nil", badCol)
+		}
+	}
+
+	// 5. Nil Queryer rejection
+	_, err = VerifyTableAndWatermark(context.Background(), nil, "history_ledgers", "sequence", 100)
+	if err == nil {
+		t.Fatal("expected error for nil Queryer, got nil")
 	}
 }
