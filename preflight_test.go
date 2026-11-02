@@ -190,3 +190,77 @@ func TestQueryCostTracker_ConcurrentRaceSafetyAndTrackQuery(t *testing.T) {
 		t.Fatalf("unexpected concurrent cost attribution summary: %+v", summary)
 	}
 }
+
+func TestCircuitBreaker_TransitionsAndSnapshotAndRaceSafety(t *testing.T) {
+	cb := NewCircuitBreaker(2, 20*time.Millisecond)
+
+	// Initial CLOSED snapshot
+	snap := cb.Snapshot()
+	if snap.State != BreakerClosed || snap.TotalTrips != 0 || snap.ConsecutiveFailures != 0 {
+		t.Fatalf("unexpected initial snapshot: %+v", snap)
+	}
+
+	// 1st failure: still CLOSED
+	failErr := errors.New("pg connection pool saturated")
+	_ = cb.Execute(func() error { return failErr })
+	snap = cb.Snapshot()
+	if snap.State != BreakerClosed || snap.ConsecutiveFailures != 1 || snap.TotalTrips != 0 {
+		t.Fatalf("expected 1 failure and CLOSED, got %+v", snap)
+	}
+
+	// 2nd failure: trips to OPEN
+	_ = cb.Execute(func() error { return failErr })
+	snap = cb.Snapshot()
+	if snap.State != BreakerOpen || snap.TotalTrips != 1 || snap.ConsecutiveFailures != 2 {
+		t.Fatalf("expected OPEN state and total_trips=1, got %+v", snap)
+	}
+
+	// Immediate call sheds with ErrCircuitOpen
+	err := cb.Execute(func() error { return nil })
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected ErrCircuitOpen, got %v", err)
+	}
+
+	// Wait for resetTimeout to expire -> transitions to HALF_OPEN
+	time.Sleep(30 * time.Millisecond)
+	snap = cb.Snapshot()
+	if snap.State != BreakerHalfOpen {
+		t.Fatalf("expected HALF_OPEN state after timeout, got %v", snap.State)
+	}
+
+	// Successful probe resets to CLOSED
+	err = cb.Execute(func() error { return nil })
+	if err != nil {
+		t.Fatalf("expected probe to succeed, got %v", err)
+	}
+	snap = cb.Snapshot()
+	if snap.State != BreakerClosed || snap.TotalTrips != 1 || snap.ConsecutiveFailures != 0 {
+		t.Fatalf("expected reset to CLOSED, got %+v", snap)
+	}
+
+	// Trip to OPEN a second time to verify TotalTrips increments accurately
+	_ = cb.Execute(func() error { return failErr })
+	_ = cb.Execute(func() error { return failErr })
+	snap = cb.Snapshot()
+	if snap.State != BreakerOpen || snap.TotalTrips != 2 {
+		t.Fatalf("expected TotalTrips=2, got %+v", snap)
+	}
+
+	// Concurrency test under race detector
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = cb.Snapshot()
+			_ = cb.State()
+			_ = cb.Execute(func() error {
+				if id%2 == 0 {
+					return nil
+				}
+				return failErr
+			})
+		}(i)
+	}
+	wg.Wait()
+}

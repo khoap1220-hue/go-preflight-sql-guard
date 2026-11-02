@@ -484,3 +484,107 @@ func (t *QueryCostTracker) Snapshot() map[string]QueryCostSummary {
 	}
 	return out
 }
+
+// BreakerState represents the operational state of a database CircuitBreaker.
+type BreakerState string
+
+const (
+	BreakerClosed   BreakerState = "CLOSED"
+	BreakerOpen     BreakerState = "OPEN"
+	BreakerHalfOpen BreakerState = "HALF_OPEN"
+)
+
+// ErrCircuitOpen is returned when an operation is attempted while the circuit breaker is OPEN.
+var ErrCircuitOpen = errors.New("circuit breaker is open: calls shed during recovery cooldown")
+
+// BreakerSnapshot captures a thread-safe point-in-time copy of circuit breaker metrics.
+type BreakerSnapshot struct {
+	State               BreakerState  `json:"state"`
+	ConsecutiveFailures int           `json:"consecutive_failures"`
+	TotalTrips          int64         `json:"total_trips"`
+	LastErrorAt         time.Time     `json:"last_error_at"`
+}
+
+// CircuitBreaker provides resilient circuit-breaking with half-open cooldown probing and telemetry snapshotting.
+type CircuitBreaker struct {
+	mu                  sync.RWMutex
+	failureThreshold    int
+	resetTimeout        time.Duration
+	state               BreakerState
+	consecutiveFailures int
+	totalTrips          int64
+	lastErrorAt         time.Time
+	lastTripAt          time.Time
+}
+
+// NewCircuitBreaker constructs a CircuitBreaker transitioning to OPEN after failureThreshold errors and probing after resetTimeout.
+func NewCircuitBreaker(failureThreshold int, resetTimeout time.Duration) *CircuitBreaker {
+	if failureThreshold < 1 {
+		failureThreshold = 3
+	}
+	if resetTimeout <= 0 {
+		resetTimeout = 10 * time.Second
+	}
+	return &CircuitBreaker{
+		failureThreshold: failureThreshold,
+		resetTimeout:     resetTimeout,
+		state:            BreakerClosed,
+	}
+}
+
+func (cb *CircuitBreaker) checkTransitionLocked() {
+	if cb.state == BreakerOpen && time.Since(cb.lastTripAt) >= cb.resetTimeout {
+		cb.state = BreakerHalfOpen
+	}
+}
+
+// State returns the current BreakerState, dynamically transitioning to HALF_OPEN when resetTimeout has elapsed.
+func (cb *CircuitBreaker) State() BreakerState {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.checkTransitionLocked()
+	return cb.state
+}
+
+// Snapshot returns a thread-safe point-in-time telemetry snapshot of circuit breaker state.
+func (cb *CircuitBreaker) Snapshot() BreakerSnapshot {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.checkTransitionLocked()
+	return BreakerSnapshot{
+		State:               cb.state,
+		ConsecutiveFailures: cb.consecutiveFailures,
+		TotalTrips:          cb.totalTrips,
+		LastErrorAt:         cb.lastErrorAt,
+	}
+}
+
+// Execute runs fn within the circuit breaker guard.
+func (cb *CircuitBreaker) Execute(fn func() error) error {
+	cb.mu.Lock()
+	cb.checkTransitionLocked()
+	if cb.state == BreakerOpen {
+		cb.mu.Unlock()
+		return ErrCircuitOpen
+	}
+	cb.mu.Unlock()
+
+	err := fn()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if err == nil {
+		cb.consecutiveFailures = 0
+		cb.state = BreakerClosed
+		return nil
+	}
+
+	cb.lastErrorAt = time.Now()
+	cb.consecutiveFailures++
+	if cb.state == BreakerHalfOpen || cb.consecutiveFailures >= cb.failureThreshold {
+		cb.state = BreakerOpen
+		cb.totalTrips++
+		cb.lastTripAt = time.Now()
+	}
+	return err
+}
