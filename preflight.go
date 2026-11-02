@@ -259,6 +259,26 @@ type SQLiteHeaderInfo struct {
 	SchemaFormat     uint32 `json:"schema_format"`
 	TextEncoding     string `json:"text_encoding"`
 	UserVersion      uint32 `json:"user_version"`
+	WALSizeBytes     int64  `json:"wal_size_bytes"`
+	WALExceeded      bool   `json:"wal_exceeded,omitempty"`
+}
+
+// CheckWALSizeBudget checks if the companion -wal file for dbPath exceeds maxWALBytes.
+// If maxWALBytes <= 0, the budget is unlimited and it returns false, nil.
+func CheckWALSizeBudget(dbPath string, maxWALBytes int64) (int64, bool, error) {
+	walPath := dbPath + "-wal"
+	stat, err := os.Stat(walPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("stat wal file: %w", err)
+	}
+	size := stat.Size()
+	if maxWALBytes > 0 && size > maxWALBytes {
+		return size, true, nil
+	}
+	return size, false, nil
 }
 
 // InspectSQLiteFileHeader reads the 100-byte binary header of a SQLite3 file without requiring CGo drivers.
@@ -312,6 +332,12 @@ func InspectSQLiteFileHeader(filePath string) (SQLiteHeaderInfo, error) {
 		encodingStr = "UTF-16be"
 	}
 
+	var walSize int64
+	walPath := filePath + "-wal"
+	if walStat, sErr := os.Stat(walPath); sErr == nil {
+		walSize = walStat.Size()
+	}
+
 	return SQLiteHeaderInfo{
 		FilePath:       filePath,
 		PageSize:       pageSize,
@@ -325,6 +351,7 @@ func InspectSQLiteFileHeader(filePath string) (SQLiteHeaderInfo, error) {
 		SchemaFormat:   schemaFormat,
 		TextEncoding:   encodingStr,
 		UserVersion:    userVersion,
+		WALSizeBytes:   walSize,
 	}, nil
 }
 
