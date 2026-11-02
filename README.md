@@ -59,3 +59,10 @@ go test -v ./...
 ## 📄 License
 
 Released under the [MIT License](LICENSE).
+
+---
+
+## 👤 Author & Verification Standard
+
+Architected and maintained by **Khoa Phan (`@khoap1220-hue`)**.
+> *"I architect and ship production-grade primitives across Rust, Go, TypeScript, and Python — powered by my proprietary multi-agent verification & triage pipeline, with every single line human-audited, race-tested (`go test -race`), and 100% GPG-signed."*
